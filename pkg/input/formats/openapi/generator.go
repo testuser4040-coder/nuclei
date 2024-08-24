@@ -20,6 +20,7 @@ import (
 	"github.com/projectdiscovery/nuclei/v3/pkg/input/formats"
 	httpTypes "github.com/projectdiscovery/nuclei/v3/pkg/input/types"
 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
+	"github.com/projectdiscovery/utils/errkit"
 	errorutil "github.com/projectdiscovery/utils/errors"
 	"github.com/projectdiscovery/utils/generic"
 	mapsutil "github.com/projectdiscovery/utils/maps"
@@ -35,7 +36,6 @@ func GenerateRequestsFromSchema(schema *openapi3.T, opts formats.InputFormatOpti
 	if len(schema.Servers) == 0 {
 		return errors.New("no servers found in openapi schema")
 	}
-
 	// new set of globalParams obtained from security schemes
 	globalParams := openapi3.NewParameters()
 
@@ -47,22 +47,6 @@ func GenerateRequestsFromSchema(schema *openapi3.T, opts formats.InputFormatOpti
 		globalParams = append(globalParams, params...)
 	}
 
-	// validate global param requirements
-	for _, param := range globalParams {
-		if val, ok := opts.Variables[param.Value.Name]; ok {
-			param.Value.Example = val
-		} else {
-			// if missing check for validation
-			if opts.SkipFormatValidation {
-				gologger.Verbose().Msgf("openapi: skipping all requests due to missing global auth parameter: %s\n", param.Value.Name)
-				return nil
-			} else {
-				// fatal error
-				gologger.Fatal().Msgf("openapi: missing global auth parameter: %s\n", param.Value.Name)
-			}
-		}
-	}
-
 	missingVarMap := make(map[string]struct{})
 	optionalVarMap := make(map[string]struct{})
 	missingParamValueCallback := func(param *openapi3.Parameter, opts *generateReqOptions) {
@@ -71,6 +55,23 @@ func GenerateRequestsFromSchema(schema *openapi3.T, opts formats.InputFormatOpti
 			return
 		}
 		missingVarMap[param.Name] = struct{}{}
+	}
+
+	// validate global param requirements
+	for _, param := range globalParams {
+		if val, ok := opts.Variables[param.Value.Name]; ok && val != "" {
+			param.Value.Example = val
+			delete(missingVarMap, param.Value.Name)
+		} else {
+			// if missing check for validation
+			if opts.SkipFormatValidation {
+				gologger.Verbose().Msgf("openapi: skipping all requests due to missing global auth parameter: %s\n", param.Value.Name)
+				return nil
+			} else {
+				// put them in missingVarMap
+				missingVarMap[param.Value.Name] = struct{}{}
+			}
+		}
 	}
 
 	for _, serverURL := range schema.Servers {
@@ -109,18 +110,20 @@ func GenerateRequestsFromSchema(schema *openapi3.T, opts formats.InputFormatOpti
 			}
 		}
 	}
-
 	if len(missingVarMap) > 0 && !opts.SkipFormatValidation {
-		gologger.Error().Msgf("openapi: Found %d missing parameters, use -skip-format-validation flag to skip requests or update missing parameters generated in %s file,you can also specify these vars using -var flag in (key=value) format\n", len(missingVarMap), formats.DefaultVarDumpFileName)
+		filename := fileNameFromTitle(schema.Info.Title)
+		gologger.Error().Msgf("openapi: Found %d missing/empty parameters, use -skip-format-validation flag to skip requests or update missing parameters generated in %s file, add pass it to nuclei using '-var %s'\n", len(missingVarMap), filename, filename)
 		gologger.Verbose().Msgf("openapi: missing params: %+v", mapsutil.GetSortedKeys(missingVarMap))
 		if config.CurrentAppMode == config.AppModeCLI {
 			// generate var dump file
-			vars := &formats.OpenAPIParamsCfgFile{}
+			vars := &formats.OpenAPIParamsCfgFile{
+				FileName: filename,
+			}
 			for k := range missingVarMap {
-				vars.Var = append(vars.Var, k+"=")
+				vars.Var = append(vars.Var, k)
 			}
 			vars.OptionalVars = mapsutil.GetSortedKeys(optionalVarMap)
-			if err := formats.WriteOpenAPIVarDumpFile(vars); err != nil {
+			if err := formats.UpdateMissingVarsFile(vars); err != nil {
 				gologger.Error().Msgf("openapi: could not write params file: %s\n", err)
 			}
 			// exit with status code 1
@@ -267,6 +270,10 @@ func generateRequestsFromOp(opts *generateReqOptions) error {
 		for content, value := range opts.op.RequestBody.Value.Content {
 			cloned := req.Clone(req.Context())
 
+			if value.Schema == nil {
+				// skip if schema is not present this is most likely a invalid content-type not recognized by openapi
+				continue
+			}
 			example, err := generateExampleFromSchema(value.Schema.Value)
 			if err != nil {
 				continue
@@ -388,31 +395,25 @@ func GetGlobalParamsForSecurityRequirement(schema *openapi3.T, requirement *open
 	if len(schema.Components.SecuritySchemes) == 0 {
 		return nil, errorutil.NewWithTag("openapi", "security requirements (%+v) without any security schemes found in openapi file", schema.Security)
 	}
-	found := false
+	missing := []string{}
 	// this api is protected for each security scheme pull its corresponding scheme
-schemaLabel:
 	for _, security := range *requirement {
 		for name := range security {
 			if scheme, ok := schema.Components.SecuritySchemes[name]; ok {
-				found = true
 				param, err := GenerateParameterFromSecurityScheme(scheme)
 				if err != nil {
 					return nil, err
 
 				}
 				globalParams = append(globalParams, &openapi3.ParameterRef{Value: param})
-				continue schemaLabel
+			} else {
+				missing = append(missing, name)
 			}
 		}
-		if !found && len(security) > 1 {
-			// if this is case then both security schemes are required
-			return nil, errorutil.NewWithTag("openapi", "security requirement (%+v) not found in openapi file", security)
-		}
 	}
-	if !found {
-		return nil, errorutil.NewWithTag("openapi", "security requirement (%+v) not found in openapi file", requirement)
+	if len(missing) > 0 {
+		return nil, errkit.New("missing schema of following security requirements (%+v)", missing)
 	}
-
 	return globalParams, nil
 }
 
@@ -472,4 +473,16 @@ func GenerateParameterFromSecurityScheme(scheme *openapi3.SecuritySchemeRef) (*o
 		}
 	}
 	return nil, errorutil.NewWithTag("openapi", "unsupported security scheme type (%s) found in openapi file", scheme.Value.Type)
+}
+
+func fileNameFromTitle(title string) string {
+	parts := strings.Fields(title)
+	if len(parts) == 0 {
+		return "openapi_vars.txt"
+	}
+	if len(parts) > 2 {
+		parts = parts[:2]
+	}
+	fileName := strings.ToLower(strings.Join(parts, "_"))
+	return fileName + "_vars.txt"
 }
